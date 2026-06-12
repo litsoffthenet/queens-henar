@@ -82,6 +82,7 @@
   .cell:hover:not(.has-queen){filter:brightness(1.18);}
   .cell.has-queen{filter:brightness(1.1);}
   .cell.hint-highlight{animation:hintPulse 1s ease 3;}
+
   @keyframes hintPulse{0%,100%{filter:brightness(1);}50%{filter:brightness(1.6);}}
   .crown{font-size:1.4em;line-height:1;filter:drop-shadow(0 2px 6px rgba(0,0,0,.7));
     animation:crownPop .25s cubic-bezier(.34,1.56,.64,1);z-index:2;pointer-events:none;}
@@ -128,7 +129,7 @@
 </head>
 <body>
 
-<h1>♛ Queens (pero mi reina eres tú)</h1>
+<h1>♛ Queens</h1>
 <p class="subtitle">Una corona por fila, columna y región de color · sin que se toquen</p>
 
 <div id="setup-panel">
@@ -184,7 +185,7 @@
   <div id="board-wrap">
     <div id="progress-bar-wrap"><div id="progress-bar"></div></div>
     <div id="board"></div>
-    <div class="mode-indicator" id="mode-indicator">1 clic = ✕ · 2 clics o clic en ✕ = ♛ · Arrastra = marcar varias</div>
+    <div class="mode-indicator" id="mode-indicator">Toca = ✕  ·  2× toca o cruz+toca = ♛  ·  Arrastra = marcar varias</div>
   </div>
 </div>
 
@@ -241,14 +242,50 @@ function solveRandom(n){
   return bt(0)?cols:null;
 }
 
-function generateBoard(n){
-  const queens=solveRandom(n);
-  if(!queens)return null;
+// Count all valid solutions for a given region grid (stops early at 2)
+function countSolutions(n, g){
+  // Precompute region membership
+  const regCells=Array.from({length:n},()=>[]);
+  for(let r=0;r<n;r++)for(let c=0;c<n;c++)regCells[g[r][c]].push([r,c]);
 
-  // Build region grid: flood fill from queen seeds
+  let count=0;
+  const usedCols=new Set(), usedRegs=new Set();
+  // blocked[r][c]: number of queens attacking this cell
+  const att=Array.from({length:n},()=>Array(n).fill(0));
+
+  function attack(qr,qc,delta){
+    for(let cc=0;cc<n;cc++)if(cc!==qc)att[qr][cc]+=delta;
+    for(let rr=0;rr<n;rr++)if(rr!==qr)att[rr][qc]+=delta;
+    const reg=g[qr][qc];
+    for(const[r,c]of regCells[reg])if(r!==qr||c!==qc)att[r][c]+=delta;
+    for(let dr=-1;dr<=1;dr++)for(let dc=-1;dc<=1;dc++){
+      if(!dr&&!dc)continue;
+      const nr=qr+dr,nc=qc+dc;
+      if(nr>=0&&nr<n&&nc>=0&&nc<n)att[nr][nc]+=delta;
+    }
+  }
+
+  function bt(row){
+    if(count>1)return; // early exit
+    if(row===n){count++;return;}
+    for(let c=0;c<n;c++){
+      if(usedCols.has(c))continue;
+      if(usedRegs.has(g[row][c]))continue;
+      if(att[row][c]>0)continue;
+      usedCols.add(c); usedRegs.add(g[row][c]);
+      attack(row,c,1);
+      bt(row+1);
+      attack(row,c,-1);
+      usedCols.delete(c); usedRegs.delete(g[row][c]);
+    }
+  }
+  bt(0);
+  return count;
+}
+
+function buildRegionGrid(n, queens){
   const g=Array.from({length:n},()=>Array(n).fill(-1));
   queens.forEach((c,r)=>{g[r][c]=r;});
-
   const dirs=[[0,1],[0,-1],[1,0],[-1,0]];
   let changed=true, iter=0;
   while(changed&&iter<n*n*6){
@@ -263,12 +300,24 @@ function generateBoard(n){
       if(nbrs.length){g[r][c]=nbrs[rnd(nbrs.length)];changed=true;}
     }
   }
-  // fallback fill
   for(let r=0;r<n;r++)for(let c=0;c<n;c++)if(g[r][c]===-1)g[r][c]=(r+c)%n;
+  return g;
+}
 
-  const sol=Array.from({length:n},()=>Array(n).fill(false));
-  queens.forEach((c,r)=>{sol[r][c]=true;});
-  return{regionGrid:g,solGrid:sol};
+function generateBoard(n){
+  const queens=solveRandom(n);
+  if(!queens)return null;
+
+  // Try up to 60 random region layouts until we find one with a unique solution
+  for(let attempt=0;attempt<60;attempt++){
+    const g=buildRegionGrid(n,queens);
+    if(countSolutions(n,g)===1){
+      const sol=Array.from({length:n},()=>Array(n).fill(false));
+      queens.forEach((c,r)=>{sol[r][c]=true;});
+      return{regionGrid:g,solGrid:sol};
+    }
+  }
+  return null; // caller will retry with a fresh queen placement
 }
 
 // ── BLOCKED ──────────────────────────────────────────────────────────────────
@@ -352,14 +401,23 @@ function place(r,c,s){
 }
 
 // ── POINTER EVENTS ───────────────────────────────────────────────────────────
-// Unified cycle: empty → cross → queen → empty
-// Click/drag both place crosses; double-click jumps to queen.
-// Drag over empty cells: place crosses. Drag over crossed cells: erase them.
+// Rules:
+//   empty  + tap/click        → cross
+//   empty  + long-press       → queen  (≥350ms, mobile-friendly)
+//   empty  + double-click     → queen  (desktop convenience, ≥2 clicks <450ms)
+//   cross  + tap/click        → queen
+//   queen  + tap/click        → empty
+//   drag from empty           → place crosses on empty cells
+//   drag from cross           → erase crosses
 
 const board=document.getElementById('board');
 board.style.touchAction='none';
 
-let lastClickCell=null, lastClickTime=0;
+// Double-click tracking (desktop)
+let lastTapCell=null, lastTapTime=0;
+// Movement threshold in px (wider for touch)
+const MOVE_THRESHOLD=8;
+let pointerStartX=0, pointerStartY=0;
 
 board.addEventListener('pointerdown',e=>{
   if(won)return;
@@ -369,60 +427,69 @@ board.addEventListener('pointerdown',e=>{
   board.setPointerCapture(e.pointerId);
   const r=+cell.dataset.r,c=+cell.dataset.c;
   pointerDownCell={r,c}; pointerMoved=false;
+  pointerStartX=e.clientX; pointerStartY=e.clientY;
 
   if(state[r][c]==='queen'){
-    // Queen: remove immediately on click
-    place(r,c,'empty'); pointerDownCell=null;
-  } else if(state[r][c]==='cross'){
-    // Cross: start erase-drag; click (no move) → queen handled in pointerup
-    isDragging=true; dragAction='erase-cross';
-  } else {
-    // Empty: start cross-drag (place crosses while dragging)
-    isDragging=true; dragAction='place-cross';
+    place(r,c,'empty'); pointerDownCell=null; return;
   }
+  if(state[r][c]==='cross'){
+    isDragging=true; dragAction='erase-cross'; return;
+  }
+  // Empty cell: start drag mode
+  isDragging=true; dragAction='place-cross';
 });
 
 board.addEventListener('pointermove',e=>{
-  if(!isDragging||!pointerDownCell)return;
+  if(!pointerDownCell)return;
+  const dx=e.clientX-pointerStartX, dy=e.clientY-pointerStartY;
+  if(Math.sqrt(dx*dx+dy*dy)>MOVE_THRESHOLD){
+    pointerMoved=true;
+  }
+  if(!isDragging)return;
   e.preventDefault();
   const el=document.elementFromPoint(e.clientX,e.clientY);
   const cell=el&&el.closest('.cell');
   if(!cell)return;
   const r=+cell.dataset.r,c=+cell.dataset.c;
-  if(r!==pointerDownCell.r||c!==pointerDownCell.c) pointerMoved=true;
   if(dragAction==='place-cross'&&state[r][c]==='empty') place(r,c,'cross');
   if(dragAction==='erase-cross'&&state[r][c]==='cross') place(r,c,'empty');
 });
 
 board.addEventListener('pointerup',e=>{
   e.preventDefault();
+
   const el=document.elementFromPoint(e.clientX,e.clientY);
   const cell=el&&el.closest('.cell');
 
-  if(cell&&pointerDownCell&&!won){
+  if(cell&&pointerDownCell&&!won&&!pointerMoved){
     const r=+cell.dataset.r,c=+cell.dataset.c;
     if(r===pointerDownCell.r&&c===pointerDownCell.c){
-      if(state[r][c]==='cross'&&!pointerMoved){
-        // Cross + click without drag → queen
+      if(state[r][c]==='cross'){
+        // Cross → queen
         place(r,c,'queen');
-      } else if(state[r][c]==='empty'&&!pointerMoved){
-        // Empty + no drag: double-click → queen, single click → cross
+        lastTapCell=null;
+      } else if(state[r][c]==='empty'){
+        // Check double-click/tap (desktop)
         const now=Date.now();
-        const isDouble=lastClickCell&&lastClickCell.r===r&&lastClickCell.c===c&&(now-lastClickTime)<400;
+        const isDouble=lastTapCell&&lastTapCell.r===r&&lastTapCell.c===c&&(now-lastTapTime)<450;
         if(isDouble){
           place(r,c,'queen');
-          lastClickCell=null;
+          lastTapCell=null;
         } else {
           place(r,c,'cross');
-          lastClickCell={r,c}; lastClickTime=now;
+          lastTapCell={r,c}; lastTapTime=now;
         }
-      } else {
-        // Drag ended on start cell — no extra action needed
-        lastClickCell=null;
       }
     }
+  } else {
+    // Pointer moved or released elsewhere — reset double-tap tracker
+    lastTapCell=null;
   }
 
+  isDragging=false; dragAction=null; pointerDownCell=null; pointerMoved=false;
+});
+
+board.addEventListener('pointercancel',e=>{
   isDragging=false; dragAction=null; pointerDownCell=null; pointerMoved=false;
 });
 
@@ -700,7 +767,7 @@ document.getElementById('win-new-btn').addEventListener('click',()=>{
 });
 
 document.getElementById('toggle-blocked').addEventListener('change',refreshAll);
-document.getElementById('mode-indicator').textContent='1 clic = ✕ · 2 clics o clic en ✕ = ♛ · Arrastra = marcar varias';
+document.getElementById('mode-indicator').textContent='Toca = ✕  ·  2× toca o cruz+toca = ♛  ·  Arrastra = marcar varias';
 </script>
 </body>
 </html>
